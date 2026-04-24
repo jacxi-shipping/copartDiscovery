@@ -21,6 +21,23 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 
+def _compute_wait(retry_state: Any) -> float:
+    """
+    Return the number of seconds to wait before the next retry attempt.
+
+    For 429 responses the server-supplied ``Retry-After`` header is
+    respected; all other cases fall back to exponential back-off.
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        retry_after = exc.response.headers.get("Retry-After", "")
+        if retry_after.isdigit():
+            delay = float(retry_after)
+            logger.debug("Honouring Retry-After: %.1fs", delay)
+            return delay
+    return wait_exponential(multiplier=1, min=RETRY_WAIT_MIN, max=RETRY_WAIT_MAX)(retry_state)
+
+
 class HttpClient:
     """
     Async HTTP client built on ``httpx.AsyncClient``.
@@ -30,6 +47,7 @@ class HttpClient:
     * HTTP/2 support (optional, enabled by default when h2 is installed).
     * Configurable headers.
     * Automatic exponential-backoff retry for transient failures.
+    * ``Retry-After`` header awareness for 429 responses.
     """
 
     def __init__(
@@ -78,26 +96,30 @@ class HttpClient:
             raise RuntimeError("HttpClient not started. Call start() or use as async context manager.")
         return self._client
 
-    async def post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _request(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
         """
-        POST *payload* as JSON to *url* and return the parsed response.
-        Retries on transient HTTP errors / network errors with exponential back-off.
+        Execute an HTTP request with automatic retry / back-off.
+
+        Retries on transient network errors, timeouts, and retryable
+        HTTP status codes (429, 5xx).
         """
         client = self._assert_started()
 
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(self._max_retries),
-            wait=wait_exponential(multiplier=1, min=RETRY_WAIT_MIN, max=RETRY_WAIT_MAX),
-            retry=retry_if_exception_type((httpx.TransportError, httpx.TimeoutException)),
+            wait=_compute_wait,
+            retry=retry_if_exception_type(
+                (httpx.TransportError, httpx.TimeoutException, httpx.HTTPStatusError)
+            ),
             reraise=True,
         ):
             with attempt:
-                logger.debug("POST %s (attempt %d)", url, attempt.retry_state.attempt_number)
-                response = await client.post(url, json=payload)
+                logger.debug(
+                    "%s %s (attempt %d)", method, url, attempt.retry_state.attempt_number
+                )
+                response = await client.request(method, url, **kwargs)
                 if response.status_code in _RETRYABLE_CODES:
-                    logger.warning(
-                        "POST %s returned %d, will retry", url, response.status_code
-                    )
+                    logger.warning("%s %s returned %d, will retry", method, url, response.status_code)
                     raise httpx.HTTPStatusError(
                         f"Retryable status {response.status_code}",
                         request=response.request,
@@ -106,34 +128,12 @@ class HttpClient:
                 response.raise_for_status()
                 return response.json()
 
-        raise RuntimeError(f"POST {url} failed after {self._max_retries} retries")  # pragma: no cover
+        raise RuntimeError(f"{method} {url} failed after {self._max_retries} retries")  # pragma: no cover
+
+    async def post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST *payload* as JSON to *url* and return the parsed response."""
+        return await self._request("POST", url, json=payload)
 
     async def get_json(self, url: str) -> dict[str, Any]:
-        """
-        GET *url* and return the parsed JSON response.
-        Retries on transient errors with exponential back-off.
-        """
-        client = self._assert_started()
-
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(self._max_retries),
-            wait=wait_exponential(multiplier=1, min=RETRY_WAIT_MIN, max=RETRY_WAIT_MAX),
-            retry=retry_if_exception_type((httpx.TransportError, httpx.TimeoutException)),
-            reraise=True,
-        ):
-            with attempt:
-                logger.debug("GET %s (attempt %d)", url, attempt.retry_state.attempt_number)
-                response = await client.get(url)
-                if response.status_code in _RETRYABLE_CODES:
-                    logger.warning(
-                        "GET %s returned %d, will retry", url, response.status_code
-                    )
-                    raise httpx.HTTPStatusError(
-                        f"Retryable status {response.status_code}",
-                        request=response.request,
-                        response=response,
-                    )
-                response.raise_for_status()
-                return response.json()
-
-        raise RuntimeError(f"GET {url} failed after {self._max_retries} retries")  # pragma: no cover
+        """GET *url* and return the parsed JSON response."""
+        return await self._request("GET", url)

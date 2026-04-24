@@ -3,39 +3,42 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from .cache import RedisCache
 from .client import HttpClient
 from .config import DEFAULT_CONCURRENCY, LOT_DETAILS_URL
-from .models import build_lot_record
+from .models import build_lot_record, parse_lot_detail_response
 
 logger = logging.getLogger(__name__)
 
-
-def _parse_lot_detail_response(response: dict[str, Any]) -> dict[str, Any]:
-    """
-    Extract the lot-detail payload from the API response wrapper.
-
-    Returns an empty dict if the expected structure is absent.
-    """
-    try:
-        # Common shape: {"data": {"lotDetails": {...}}}
-        detail = response.get("data", {}).get("lotDetails") or {}
-        if detail:
-            return detail
-
-        # Flat shape — the response itself is the detail
-        if "lotNumber" in response or "lot_number" in response:
-            return response
-    except (AttributeError, TypeError):
-        pass
-    return {}
+# Keep the old private name as an alias so existing imports keep working.
+_parse_lot_detail_response = parse_lot_detail_response
 
 
-async def _hydrate_single(
+@dataclasses.dataclass
+class HydrationStats:
+    """Per-run metrics for a call to :func:`hydrate_lots`."""
+
+    total: int
+    cache_hits: int
+    cache_misses: int
+    api_failures: int
+    elapsed_seconds: float
+
+    @property
+    def success_rate(self) -> float:
+        """Fraction of lots that were successfully returned (0–1)."""
+        if self.total == 0:
+            return 0.0
+        return (self.total - self.api_failures) / self.total
+
+
+async def _fetch_lot_from_api(
     lot_number: str,
     http_client: HttpClient,
     cache: RedisCache,
@@ -43,21 +46,10 @@ async def _hydrate_single(
     ttl: int | None = None,
 ) -> dict[str, Any] | None:
     """
-    Hydrate a single lot, consulting Redis first.
+    Fetch a single lot from the Copart API, validate, normalise, and cache it.
 
-    Steps:
-    1. Check Redis cache.
-    2. If miss, fetch from Copart API.
-    3. Validate and normalise the response.
-    4. Store in Redis.
-    5. Return the normalised record.
+    Returns the normalised dict on success, ``None`` on any failure.
     """
-    # 1. Cache look-up
-    cached = await cache.get_lot(lot_number)
-    if cached is not None:
-        return cached
-
-    # 2. Fetch from API (throttled by semaphore)
     async with semaphore:
         url = LOT_DETAILS_URL.format(lot_number=lot_number)
         logger.info("Hydrating lot %s from API", lot_number)
@@ -67,8 +59,7 @@ async def _hydrate_single(
             logger.error("Failed to hydrate lot %s: %s", lot_number, exc)
             return None
 
-    # 3. Parse + validate
-    raw_detail = _parse_lot_detail_response(response)
+    raw_detail = parse_lot_detail_response(response)
     if not raw_detail:
         logger.warning("Empty lot detail for %s", lot_number)
         return None
@@ -79,10 +70,9 @@ async def _hydrate_single(
         logger.warning("Validation failed for lot %s", lot_number)
         return None
 
-    # 4. Store in Redis
-    await cache.set_lot(lot_number, record, ttl=ttl)
-
-    return record
+    record_dict = record.to_dict()
+    await cache.set_lot(lot_number, record_dict, ttl=ttl)
+    return record_dict
 
 
 async def hydrate_lots(
@@ -92,9 +82,10 @@ async def hydrate_lots(
     *,
     concurrency: int = DEFAULT_CONCURRENCY,
     ttl: int | None = None,
-) -> list[dict[str, Any]]:
+    force_refresh: bool = False,
+) -> tuple[list[dict[str, Any]], HydrationStats]:
     """
-    Hydrate *lot_numbers* concurrently.
+    Hydrate *lot_numbers* concurrently, consulting Redis first.
 
     Parameters
     ----------
@@ -103,29 +94,75 @@ async def hydrate_lots(
     http_client:
         Started ``HttpClient`` instance.
     cache:
-        Connected ``RedisCache`` instance.
+        Connected cache instance (``RedisCache`` or ``NullCache``).
     concurrency:
-        Maximum simultaneous in-flight requests.
+        Maximum simultaneous in-flight API requests.
     ttl:
         Cache TTL override (seconds); ``None`` uses the cache default.
+    force_refresh:
+        When ``True``, skip cache reads and re-fetch everything from the API.
 
     Returns
     -------
-    list[dict]
-        Successfully hydrated records (failed lots are omitted).
+    tuple[list[dict], HydrationStats]
+        Successfully hydrated records (failed lots are omitted) and run stats.
     """
     if not lot_numbers:
-        return []
+        empty_stats = HydrationStats(
+            total=0, cache_hits=0, cache_misses=0, api_failures=0, elapsed_seconds=0.0
+        )
+        return [], empty_stats
 
-    semaphore = asyncio.Semaphore(concurrency)
-    tasks = [
-        _hydrate_single(ln, http_client, cache, semaphore, ttl=ttl)
-        for ln in lot_numbers
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
+    t0 = time.monotonic()
+    records: list[dict[str, Any]] = []
+    api_failures = 0
 
-    records = [r for r in results if r is not None]
-    logger.info(
-        "Hydration complete: %d/%d lots succeeded", len(records), len(lot_numbers)
+    if force_refresh:
+        # Skip cache; fetch everything from the API.
+        cached_map: dict[str, Any] = {ln: None for ln in lot_numbers}
+    else:
+        # Single MGET round-trip instead of N individual GETs.
+        cached_map = await cache.get_lots_bulk(lot_numbers)
+
+    cache_hits = sum(1 for v in cached_map.values() if v is not None)
+    misses = [ln for ln, v in cached_map.items() if v is None]
+
+    # Return cached records in original insertion order.
+    for ln in lot_numbers:
+        cached = cached_map.get(ln)
+        if cached is not None:
+            records.append(cached)
+
+    # Fetch misses from the API concurrently.
+    if misses:
+        semaphore = asyncio.Semaphore(concurrency)
+        tasks = [
+            _fetch_lot_from_api(ln, http_client, cache, semaphore, ttl=ttl)
+            for ln in misses
+        ]
+        api_results = await asyncio.gather(*tasks, return_exceptions=False)
+        for result in api_results:
+            if result is not None:
+                records.append(result)
+            else:
+                api_failures += 1
+
+    elapsed = time.monotonic() - t0
+    stats = HydrationStats(
+        total=len(lot_numbers),
+        cache_hits=cache_hits,
+        cache_misses=len(misses),
+        api_failures=api_failures,
+        elapsed_seconds=round(elapsed, 3),
     )
-    return records
+    logger.info(
+        "Hydration complete: %d/%d lots succeeded "
+        "(hits=%d misses=%d failures=%d elapsed=%.3fs)",
+        len(records),
+        len(lot_numbers),
+        stats.cache_hits,
+        stats.cache_misses,
+        stats.api_failures,
+        stats.elapsed_seconds,
+    )
+    return records, stats

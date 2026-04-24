@@ -2,7 +2,12 @@
 
 import pytest
 
-from discovery_engine.models import build_lot_record, validate_search_payload
+from discovery_engine.models import (
+    LotRecord,
+    build_lot_record,
+    parse_lot_detail_response,
+    validate_search_payload,
+)
 
 
 class TestBuildLotRecord:
@@ -17,13 +22,22 @@ class TestBuildLotRecord:
         }
         record = build_lot_record(raw, fetched_at="2026-04-24T12:00:00Z")
         assert record is not None
-        assert record["lotNumber"] == "12345678"
-        assert record["lotDescription"] == "2021 Toyota Camry"
-        assert record["vin"] == "JT1234567890123456"
-        assert record["odometer"] == 15000.0
-        assert record["repairCost"] == 1200.0
-        assert len(record["imagesList"]) == 2
-        assert record["fetched_at"] == "2026-04-24T12:00:00Z"
+        assert isinstance(record, LotRecord)
+        assert record.lotNumber == "12345678"
+        assert record.lotDescription == "2021 Toyota Camry"
+        assert record.vin == "JT1234567890123456"
+        assert record.odometer == 15000.0
+        assert record.repairCost == 1200.0
+        assert len(record.imagesList) == 2
+        assert record.fetched_at == "2026-04-24T12:00:00Z"
+
+    def test_to_dict_is_json_serialisable(self):
+        raw = {"lotNumber": "12345678", "odometer": 1000}
+        record = build_lot_record(raw, fetched_at="2026-04-24T12:00:00Z")
+        assert record is not None
+        d = record.to_dict()
+        assert isinstance(d, dict)
+        assert d["lotNumber"] == "12345678"
 
     def test_missing_lot_number_returns_none(self):
         raw = {"lotDescription": "2021 Toyota Camry"}
@@ -37,42 +51,42 @@ class TestBuildLotRecord:
         raw = {"lotNumber": "99999999"}
         record = build_lot_record(raw)
         assert record is not None
-        assert record["lotDescription"] == ""
-        assert record["vin"] == ""
-        assert record["odometer"] is None
-        assert record["repairCost"] is None
-        assert record["imagesList"] == []
+        assert record.lotDescription == ""
+        assert record.vin == ""
+        assert record.odometer is None
+        assert record.repairCost is None
+        assert record.imagesList == []
 
     def test_images_filters_non_strings(self):
         raw = {"lotNumber": "11111111", "imagesList": ["https://a.com/img.jpg", 42, None, "https://b.com/img.jpg"]}
         record = build_lot_record(raw)
         assert record is not None
-        assert record["imagesList"] == ["https://a.com/img.jpg", "https://b.com/img.jpg"]
+        assert record.imagesList == ["https://a.com/img.jpg", "https://b.com/img.jpg"]
 
     def test_numeric_lot_number_coerced(self):
         raw = {"lotNumber": 55555555}
         record = build_lot_record(raw)
         assert record is not None
-        assert record["lotNumber"] == "55555555"
+        assert record.lotNumber == "55555555"
 
     def test_odometer_string_coerced(self):
         raw = {"lotNumber": "22222222", "odometer": "30000"}
         record = build_lot_record(raw)
         assert record is not None
-        assert record["odometer"] == 30000.0
+        assert record.odometer == 30000.0
 
     def test_odometer_invalid_returns_none(self):
         raw = {"lotNumber": "33333333", "odometer": "not-a-number"}
         record = build_lot_record(raw)
         assert record is not None
-        assert record["odometer"] is None
+        assert record.odometer is None
 
     def test_fetched_at_auto_populated(self):
         raw = {"lotNumber": "44444444"}
         record = build_lot_record(raw)
         assert record is not None
-        assert "fetched_at" in record
-        assert "T" in record["fetched_at"]
+        assert "fetched_at" in record.to_dict()
+        assert "T" in record.fetched_at
 
     def test_alternative_field_names(self):
         raw = {
@@ -82,9 +96,34 @@ class TestBuildLotRecord:
         }
         record = build_lot_record(raw)
         assert record is not None
-        assert record["lotNumber"] == "77777777"
-        assert record["lotDescription"] == "2020 Ford F150"
-        assert record["repairCost"] == 500.0
+        assert record.lotNumber == "77777777"
+        assert record.lotDescription == "2020 Ford F150"
+        assert record.repairCost == 500.0
+
+
+class TestParseLotDetailResponse:
+    def test_nested_lot_details(self):
+        response = {
+            "data": {
+                "lotDetails": {
+                    "lotNumber": "12345678",
+                    "vin": "ABC123",
+                }
+            }
+        }
+        detail = parse_lot_detail_response(response)
+        assert detail["lotNumber"] == "12345678"
+
+    def test_flat_response(self):
+        response = {"lotNumber": "87654321", "vin": "XYZ456"}
+        detail = parse_lot_detail_response(response)
+        assert detail["lotNumber"] == "87654321"
+
+    def test_empty_response_returns_empty_dict(self):
+        assert parse_lot_detail_response({}) == {}
+
+    def test_malformed_response_returns_empty_dict(self):
+        assert parse_lot_detail_response({"data": "bad"}) == {}
 
 
 class TestValidateSearchPayload:

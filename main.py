@@ -10,8 +10,15 @@ Request mode (hydrate specific lots):
 Bulk mode (search + hydrate, up to 200 lots):
     python main.py bulk --make TOYOTA --year 2020-2024 --max-results 200
 
-Bulk mode with output file:
-    python main.py bulk --make FORD --output results.json
+Bulk mode with custom sort and output file:
+    python main.py bulk --make FORD --sort-column auctionDate --sort-order asc \\
+        --output results.json
+
+Force-refresh (bypass cache):
+    python main.py bulk --make HONDA --force-refresh
+
+Health check (probe Redis + Copart API):
+    python main.py healthcheck
 
 Environment variables
 ---------------------
@@ -46,9 +53,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Logging verbosity (default: INFO)",
     )
     parser.add_argument(
+        "--json-logs",
+        action="store_true",
+        default=False,
+        help="Emit structured JSON log lines (requires python-json-logger)",
+    )
+    parser.add_argument(
         "--redis-url",
         default=os.getenv("REDIS_URL", "redis://localhost:6379"),
         help="Redis connection URL",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help="Disable Redis caching (useful for development / when Redis is unavailable)",
     )
     parser.add_argument(
         "--ttl",
@@ -69,6 +88,12 @@ def _build_parser() -> argparse.ArgumentParser:
     req = sub.add_parser("request", help="Hydrate specific lot numbers")
     req.add_argument("lot_numbers", nargs="+", help="One or more lot numbers")
     req.add_argument("--output", help="Write results to this JSON file")
+    req.add_argument(
+        "--force-refresh",
+        action="store_true",
+        default=False,
+        help="Bypass cache and re-fetch every lot from the API",
+    )
 
     # ---- bulk mode ----
     bulk = sub.add_parser("bulk", help="Search and bulk-hydrate lots")
@@ -87,6 +112,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Filter by year range, e.g. 2020-2024",
     )
     bulk.add_argument(
+        "--sort-column",
+        default="auctionDate",
+        help="Column to sort results by (default: auctionDate)",
+    )
+    bulk.add_argument(
+        "--sort-order",
+        default="desc",
+        choices=["asc", "desc"],
+        help="Sort direction (default: desc)",
+    )
+    bulk.add_argument(
         "--max-results",
         type=int,
         default=1000,
@@ -99,6 +135,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Lots per search page (default: 100)",
     )
     bulk.add_argument("--output", help="Write results to this JSON file")
+    bulk.add_argument(
+        "--force-refresh",
+        action="store_true",
+        default=False,
+        help="Bypass cache and re-fetch every lot from the API",
+    )
+
+    # ---- healthcheck ----
+    sub.add_parser("healthcheck", help="Probe Redis and Copart API connectivity")
 
     return parser
 
@@ -109,9 +154,18 @@ async def run(args: argparse.Namespace) -> list[dict]:
         redis_url=args.redis_url,
         cache_ttl=args.ttl,
         concurrency=args.concurrency,
+        use_cache=not args.no_cache,
     ) as engine:
+        if args.mode == "healthcheck":
+            status = await engine.health_check()
+            print(json.dumps(status, indent=2))
+            return []
+
         if args.mode == "request":
-            return await engine.request_mode(args.lot_numbers)
+            return await engine.request_mode(
+                args.lot_numbers,
+                force_refresh=args.force_refresh,
+            )
 
         # bulk mode
         filters: dict = {}
@@ -120,26 +174,31 @@ async def run(args: argparse.Namespace) -> list[dict]:
         if args.years:
             filters["year"] = args.years
 
+        sort = {"column": args.sort_column, "order": args.sort_order}
+
         return await engine.bulk_mode(
             filters=filters or None,
+            sort=sort,
             max_results=args.max_results,
             page_size=args.page_size,
+            force_refresh=args.force_refresh,
         )
 
 
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
-    configure_logging(args.log_level)
+    configure_logging(args.log_level, json_logs=args.json_logs)
 
     records = asyncio.run(run(args))
 
-    output = json.dumps(records, indent=2, ensure_ascii=False)
-    print(output)
+    if args.mode != "healthcheck":
+        output = json.dumps(records, indent=2, ensure_ascii=False)
+        print(output)
 
-    if hasattr(args, "output") and args.output:
-        DiscoveryEngine.save_json(records, args.output)
-        logger.info("Results saved to %s", args.output)
+        if hasattr(args, "output") and args.output:
+            DiscoveryEngine.save_json(records, args.output)
+            logger.info("Results saved to %s", args.output)
 
     sys.exit(0)
 

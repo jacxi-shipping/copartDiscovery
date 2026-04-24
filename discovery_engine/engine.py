@@ -18,7 +18,7 @@ import json
 import logging
 from typing import Any
 
-from .cache import RedisCache
+from .cache import NullCache, RedisCache
 from .client import HttpClient
 from .config import (
     BULK_MAX_RESULTS,
@@ -26,8 +26,9 @@ from .config import (
     DEFAULT_CONCURRENCY,
     DEFAULT_PAGE_SIZE,
     REDIS_URL,
+    SEARCH_URL,
 )
-from .hydration import hydrate_lots
+from .hydration import HydrationStats, hydrate_lots
 from .search import search_lots_bulk
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,9 @@ class DiscoveryEngine:
         Max simultaneous hydration requests.
     http_headers:
         Extra headers to merge into all HTTP requests.
+    use_cache:
+        Set to ``False`` to disable Redis caching (useful for development
+        or when Redis is unavailable).  A :class:`NullCache` is used instead.
     """
 
     def __init__(
@@ -55,11 +59,15 @@ class DiscoveryEngine:
         cache_ttl: int = DEFAULT_CACHE_TTL,
         concurrency: int = DEFAULT_CONCURRENCY,
         http_headers: dict[str, str] | None = None,
+        use_cache: bool = True,
     ) -> None:
-        self._cache = RedisCache(redis_url=redis_url, ttl=cache_ttl)
+        self._cache: RedisCache | NullCache = (
+            RedisCache(redis_url=redis_url, ttl=cache_ttl) if use_cache else NullCache()
+        )
         self._http = HttpClient(headers=http_headers)
         self._concurrency = concurrency
         self._cache_ttl = cache_ttl
+        self._last_stats: HydrationStats | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -88,11 +96,17 @@ class DiscoveryEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def last_stats(self) -> HydrationStats | None:
+        """Stats from the most recent :meth:`request_mode` / :meth:`bulk_mode` call."""
+        return self._last_stats
+
     async def request_mode(
         self,
         lot_numbers: list[str],
         *,
         ttl: int | None = None,
+        force_refresh: bool = False,
     ) -> list[dict[str, Any]]:
         """
         **Request Mode** — hydrate specific lot numbers.
@@ -103,6 +117,8 @@ class DiscoveryEngine:
             Lot numbers to fetch/hydrate.
         ttl:
             Optional TTL override (seconds).
+        force_refresh:
+            Skip cache reads and re-fetch every lot from the API.
 
         Returns
         -------
@@ -110,13 +126,15 @@ class DiscoveryEngine:
             Flattened JSON-compatible records.
         """
         logger.info("Request Mode: hydrating %d lot(s)", len(lot_numbers))
-        records = await hydrate_lots(
+        records, stats = await hydrate_lots(
             lot_numbers,
             self._http,
             self._cache,
             concurrency=self._concurrency,
             ttl=ttl if ttl is not None else self._cache_ttl,
+            force_refresh=force_refresh,
         )
+        self._last_stats = stats
         logger.info("Request Mode: returned %d record(s)", len(records))
         return records
 
@@ -128,6 +146,7 @@ class DiscoveryEngine:
         max_results: int = BULK_MAX_RESULTS,
         page_size: int = DEFAULT_PAGE_SIZE,
         ttl: int | None = None,
+        force_refresh: bool = False,
     ) -> list[dict[str, Any]]:
         """
         **Bulk Mode** — search and hydrate up to *max_results* lots.
@@ -144,6 +163,8 @@ class DiscoveryEngine:
             Lots per search page (default 100).
         ttl:
             Optional TTL override (seconds).
+        force_refresh:
+            Skip cache reads and re-fetch every lot from the API.
 
         Returns
         -------
@@ -179,15 +200,45 @@ class DiscoveryEngine:
         if not lot_numbers:
             return []
 
-        records = await hydrate_lots(
+        records, stats = await hydrate_lots(
             lot_numbers,
             self._http,
             self._cache,
             concurrency=self._concurrency,
             ttl=ttl if ttl is not None else self._cache_ttl,
+            force_refresh=force_refresh,
         )
+        self._last_stats = stats
         logger.info("Bulk Mode: returned %d record(s)", len(records))
         return records
+
+    async def health_check(self) -> dict[str, Any]:
+        """
+        Probe connectivity to Redis and the Copart search API.
+
+        Returns a dict with ``"redis"`` and ``"api"`` keys, each set to
+        ``"ok"`` or an error string.
+        """
+        status: dict[str, Any] = {"redis": "unknown", "api": "unknown"}
+
+        # Redis probe
+        try:
+            ok = await self._cache.ping()
+            status["redis"] = "ok" if ok else "error: ping returned False"
+        except Exception as exc:  # noqa: BLE001
+            status["redis"] = f"error: {exc}"
+
+        # Copart API probe — minimal 1-result search
+        try:
+            await self._http.post_json(
+                SEARCH_URL,
+                {"query": "*", "filter": {}, "page": 0, "size": 1},
+            )
+            status["api"] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            status["api"] = f"error: {exc}"
+
+        return status
 
     # ------------------------------------------------------------------
     # Convenience helpers
