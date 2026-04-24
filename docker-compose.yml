@@ -1,0 +1,32 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  discovery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      CACHE_TTL_SECONDS: "86400"
+    volumes:
+      - ./output:/app/output
+    # Override the default command to run bulk mode, e.g.:
+    #   docker compose run --rm discovery bulk --make TOYOTA --output /app/output/results.json
+    command: ["python", "main.py", "--help"]
+
+volumes:
+  redis_data:

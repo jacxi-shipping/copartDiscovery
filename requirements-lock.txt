@@ -1,0 +1,18 @@
+# Pinned runtime dependencies (generated via pip freeze).
+# Use this file for fully reproducible installs:
+#   pip install -r requirements-lock.txt
+#
+# To update: pip install -r requirements.txt && pip freeze > requirements-lock.txt
+
+anyio==4.13.0
+certifi==2023.11.17
+h11==0.16.0
+h2==4.3.0
+hpack==4.1.0
+httpcore==1.0.9
+httpx==0.28.1
+hyperframe==6.1.0
+python-json-logger==4.1.0
+redis==7.4.0
+tenacity==9.1.4
+typing_extensions==4.15.0
