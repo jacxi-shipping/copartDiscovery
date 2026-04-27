@@ -5,6 +5,7 @@ import pytest
 from discovery_engine.models import (
     LotRecord,
     build_lot_record,
+    build_lot_record_from_search_hit,
     parse_lot_detail_response,
     validate_search_payload,
 )
@@ -124,6 +125,27 @@ class TestParseLotDetailResponse:
 
     def test_malformed_response_returns_empty_dict(self):
         assert parse_lot_detail_response({"data": "bad"}) == {}
+
+
+class TestBuildLotRecordFromSearchHit:
+    def test_builds_partial_record_from_search_hit(self):
+        hit = {
+            "ln": 12345678,
+            "ld": "2020 TOYOTA CAMRY",
+            "thb": "https://img.example.com/123.jpg",
+            "odometer": 50000,
+        }
+        record = build_lot_record_from_search_hit(hit, fetched_at="2026-04-27T00:00:00Z")
+
+        assert record is not None
+        assert record.lotNumber == "12345678"
+        assert record.lotDescription == "2020 TOYOTA CAMRY"
+        assert record.vin == ""
+        assert record.odometer == 50000.0
+        assert record.imagesList == ["https://img.example.com/123.jpg"]
+
+    def test_requires_lot_number(self):
+        assert build_lot_record_from_search_hit({"ld": "No lot"}) is None
 
 
 class TestValidateSearchPayload:

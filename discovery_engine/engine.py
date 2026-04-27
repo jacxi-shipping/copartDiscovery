@@ -18,10 +18,15 @@ import json
 import logging
 from typing import Any
 
+from .auth import authenticate_copart_session, parse_cookie_header
 from .cache import NullCache, RedisCache
 from .client import HttpClient
 from .config import (
     BULK_MAX_RESULTS,
+    COPART_AUTH_ENABLED,
+    COPART_PASSWORD,
+    COPART_SESSION_COOKIES,
+    COPART_USERNAME,
     DEFAULT_CACHE_TTL,
     DEFAULT_CONCURRENCY,
     DEFAULT_PAGE_SIZE,
@@ -60,6 +65,10 @@ class DiscoveryEngine:
         concurrency: int = DEFAULT_CONCURRENCY,
         http_headers: dict[str, str] | None = None,
         use_cache: bool = True,
+        copart_username: str | None = None,
+        copart_password: str | None = None,
+        copart_session_cookies: str | None = None,
+        auth_enabled: bool = COPART_AUTH_ENABLED,
     ) -> None:
         self._cache: RedisCache | NullCache = (
             RedisCache(redis_url=redis_url, ttl=cache_ttl) if use_cache else NullCache()
@@ -68,6 +77,15 @@ class DiscoveryEngine:
         self._concurrency = concurrency
         self._cache_ttl = cache_ttl
         self._last_stats: HydrationStats | None = None
+        self._copart_username = copart_username if copart_username is not None else COPART_USERNAME
+        self._copart_password = copart_password if copart_password is not None else COPART_PASSWORD
+        raw_cookies = (
+            copart_session_cookies
+            if copart_session_cookies is not None
+            else COPART_SESSION_COOKIES
+        )
+        self._copart_session_cookies = parse_cookie_header(raw_cookies)
+        self._auth_enabled = auth_enabled
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -76,6 +94,21 @@ class DiscoveryEngine:
     async def _startup(self) -> None:
         await self._cache.connect()
         await self._http.start()
+        if self._auth_enabled and self._copart_session_cookies:
+            self._http.update_cookies(self._copart_session_cookies)
+            logger.info("Copart session cookies loaded from environment")
+            return
+
+        if self._auth_enabled and self._copart_username and self._copart_password:
+            auth_result = await authenticate_copart_session(
+                self._copart_username,
+                self._copart_password,
+            )
+            if auth_result.success:
+                self._http.update_cookies(auth_result.cookies)
+                logger.info("Copart authenticated session initialised")
+            else:
+                logger.warning("Copart auth unavailable: %s", auth_result.reason)
 
     async def _shutdown(self) -> None:
         await self._http.close()
@@ -147,6 +180,7 @@ class DiscoveryEngine:
         page_size: int = DEFAULT_PAGE_SIZE,
         ttl: int | None = None,
         force_refresh: bool = False,
+        fail_fast_search_errors: bool = False,
     ) -> list[dict[str, Any]]:
         """
         **Bulk Mode** — search and hydrate up to *max_results* lots.
@@ -165,6 +199,10 @@ class DiscoveryEngine:
             Optional TTL override (seconds).
         force_refresh:
             Skip cache reads and re-fetch every lot from the API.
+        fail_fast_search_errors:
+            If ``True``, search API failures immediately raise and abort
+            bulk mode. If ``False`` (default), failures stop pagination
+            gracefully and return whatever was collected so far.
 
         Returns
         -------
@@ -180,20 +218,26 @@ class DiscoveryEngine:
 
         # Collect lot numbers from search
         lot_numbers: list[str] = []
+        search_hits_by_lot: dict[str, dict[str, Any]] = {}
         async for raw_lot in search_lots_bulk(
             self._http,
             filters=filters,
             sort=sort,
             max_results=max_results,
             page_size=page_size,
+            fail_fast=fail_fast_search_errors,
         ):
             lot_num = str(
                 raw_lot.get("lotNumber")
                 or raw_lot.get("lot_number")
+                or raw_lot.get("lotNumberStr")
+                or raw_lot.get("ln")
                 or ""
             ).strip()
             if lot_num:
                 lot_numbers.append(lot_num)
+                # Keep the full hit to allow partial-record fallback if detail API is blocked.
+                search_hits_by_lot[lot_num] = raw_lot
 
         logger.info("Bulk Mode: %d lot numbers collected from search", len(lot_numbers))
 
@@ -207,6 +251,7 @@ class DiscoveryEngine:
             concurrency=self._concurrency,
             ttl=ttl if ttl is not None else self._cache_ttl,
             force_refresh=force_refresh,
+            search_fallback_map=search_hits_by_lot,
         )
         self._last_stats = stats
         logger.info("Bulk Mode: returned %d record(s)", len(records))

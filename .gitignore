@@ -17,7 +17,11 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+tmp/
 
 # Editor
 .vscode/
 .idea/
+
+# Local secrets
+.env

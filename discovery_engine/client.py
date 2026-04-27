@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 from tenacity import (
     AsyncRetrying,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -19,6 +19,15 @@ logger = logging.getLogger(__name__)
 
 # Status codes that are worth retrying
 _RETRYABLE_CODES = {429, 500, 502, 503, 504}
+
+
+def _is_retryable_exception(exc: BaseException) -> bool:
+    """Return True when *exc* should trigger a retry attempt."""
+    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_CODES
+    return False
 
 
 def _compute_wait(retry_state: Any) -> float:
@@ -60,6 +69,7 @@ class HttpClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._client: httpx.AsyncClient | None = None
+        self._pending_cookies: dict[str, str] = {}
 
     async def start(self) -> None:
         """Create the underlying ``httpx.AsyncClient``."""
@@ -69,6 +79,16 @@ class HttpClient:
             http2=True,
             follow_redirects=True,
         )
+        if self._pending_cookies:
+            self._client.cookies.update(self._pending_cookies)
+
+    def update_cookies(self, cookies: dict[str, str]) -> None:
+        """Merge cookies into the active client (or queue them before start)."""
+        if not cookies:
+            return
+        self._pending_cookies.update(cookies)
+        if self._client is not None:
+            self._client.cookies.update(cookies)
 
     async def close(self) -> None:
         """Close the underlying client."""
@@ -108,9 +128,7 @@ class HttpClient:
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(self._max_retries),
             wait=_compute_wait,
-            retry=retry_if_exception_type(
-                (httpx.TransportError, httpx.TimeoutException, httpx.HTTPStatusError)
-            ),
+            retry=retry_if_exception(_is_retryable_exception),
             reraise=True,
         ):
             with attempt:

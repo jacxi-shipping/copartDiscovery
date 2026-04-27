@@ -13,6 +13,7 @@ dependencies = [
     "redis[asyncio]>=5.0.0",
     "tenacity>=8.2.3",
     "python-json-logger>=3.0.0",
+    "playwright>=1.52.0",
 ]
 
 [project.scripts]

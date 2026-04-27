@@ -21,6 +21,10 @@ def _mock_engine():
     engine._concurrency = 5
     engine._cache_ttl = 3600
     engine._last_stats = None
+    engine._auth_enabled = False
+    engine._copart_username = ""
+    engine._copart_password = ""
+    engine._copart_session_cookies = {}
 
     cache = MagicMock()
     cache.connect = AsyncMock()
@@ -161,6 +165,37 @@ class TestDiscoveryEngineBulkMode:
         ):
             await engine.bulk_mode(sort={"column": "repairCost", "order": "asc"})
 
+    @pytest.mark.asyncio
+    async def test_bulk_mode_fail_fast_search_error_propagates(self):
+        engine = _mock_engine()
+
+        async def _failing_search(*args, **kwargs):
+            raise RuntimeError("search failed")
+            yield  # pragma: no cover
+
+        with patch("discovery_engine.engine.search_lots_bulk", side_effect=_failing_search):
+            with pytest.raises(RuntimeError, match="search failed"):
+                await engine.bulk_mode(fail_fast_search_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_bulk_mode_passes_search_fallback_map_to_hydration(self):
+        engine = _mock_engine()
+
+        async def _fake_search(*args, **kwargs):
+            yield {"ln": "12345", "ld": "Search Car"}
+
+        with (
+            patch("discovery_engine.engine.search_lots_bulk", side_effect=_fake_search),
+            patch(
+                "discovery_engine.engine.hydrate_lots",
+                new=AsyncMock(return_value=([], _make_stats(total=0))),
+            ) as mock_hydrate,
+        ):
+            await engine.bulk_mode()
+
+        _, kwargs = mock_hydrate.call_args
+        assert kwargs["search_fallback_map"]["12345"]["ld"] == "Search Car"
+
 
 class TestDiscoveryEngineHealthCheck:
     @pytest.mark.asyncio
@@ -224,3 +259,37 @@ class TestDiscoveryEngineContextManager:
 
         engine._http.close.assert_called_once()
         engine._cache.close.assert_called_once()
+
+
+class TestDiscoveryEngineAuthBootstrap:
+    @pytest.mark.asyncio
+    async def test_startup_applies_cookies_on_auth_success(self):
+        engine = _mock_engine()
+        engine._auth_enabled = True
+        engine._copart_username = "user@example.com"
+        engine._copart_password = "secret"
+        engine._http.update_cookies = MagicMock()
+
+        with patch(
+            "discovery_engine.engine.authenticate_copart_session",
+            new=AsyncMock(return_value=MagicMock(success=True, cookies={"foo": "bar"}, reason="ok")),
+        ):
+            await engine._startup()
+
+        engine._http.update_cookies.assert_called_once_with({"foo": "bar"})
+
+    @pytest.mark.asyncio
+    async def test_startup_continues_when_auth_fails(self):
+        engine = _mock_engine()
+        engine._auth_enabled = True
+        engine._copart_username = "user@example.com"
+        engine._copart_password = "secret"
+        engine._http.update_cookies = MagicMock()
+
+        with patch(
+            "discovery_engine.engine.authenticate_copart_session",
+            new=AsyncMock(return_value=MagicMock(success=False, cookies={}, reason="blocked")),
+        ):
+            await engine._startup()
+
+        engine._http.update_cookies.assert_not_called()

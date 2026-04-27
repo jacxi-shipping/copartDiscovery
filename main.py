@@ -17,13 +17,21 @@ Bulk mode with custom sort and output file:
 Force-refresh (bypass cache):
     python main.py bulk --make HONDA --force-refresh
 
+Fail-fast search errors:
+    python main.py bulk --make TOYOTA --strict-search-errors
+
 Health check (probe Redis + Copart API):
     python main.py healthcheck
+
+Auth check (validate cookie/credential auth context):
+    python main.py authcheck
 
 Environment variables
 ---------------------
 REDIS_URL          Redis connection string (default: redis://localhost:6379)
 CACHE_TTL_SECONDS  Cache TTL in seconds    (default: 86400 = 24 h)
+COPART_SEARCH_URL  Search endpoint override
+COPART_LOT_DETAILS_URL  Lot-details endpoint template override
 """
 
 from __future__ import annotations
@@ -36,6 +44,8 @@ import os
 import sys
 
 from discovery_engine import DiscoveryEngine
+from discovery_engine.auth import check_copart_auth_session, parse_cookie_header
+from discovery_engine.config import COPART_PASSWORD, COPART_SESSION_COOKIES, COPART_USERNAME
 from discovery_engine.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -141,15 +151,84 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Bypass cache and re-fetch every lot from the API",
     )
+    bulk.add_argument(
+        "--strict-search-errors",
+        action="store_true",
+        default=False,
+        help="Fail fast on search API errors instead of returning partial/empty results",
+    )
 
     # ---- healthcheck ----
     sub.add_parser("healthcheck", help="Probe Redis and Copart API connectivity")
+
+    # ---- authcheck ----
+    authcheck = sub.add_parser("authcheck", help="Validate Copart authenticated session context")
+    authcheck.add_argument(
+        "--auth-mode",
+        default="auto",
+        choices=["auto", "cookies", "credentials"],
+        help="Which auth input to validate (default: auto)",
+    )
+    authcheck.add_argument(
+        "--playwright-debug",
+        action="store_true",
+        default=False,
+        help="Include Playwright frame/input diagnostics in auth failure reason",
+    )
+    authcheck.add_argument(
+        "--playwright-pause-seconds",
+        type=float,
+        default=0.0,
+        help="Pause on login page for N seconds before attempting credential fill",
+    )
+    authcheck.add_argument(
+        "--playwright-headed",
+        action="store_true",
+        default=False,
+        help="Force headed Playwright login for local interactive debugging",
+    )
+    authcheck.add_argument(
+        "--playwright-artifact-dir",
+        default="",
+        help="Directory where authcheck writes screenshot/HTML artifacts on Playwright failure",
+    )
 
     return parser
 
 
 async def run(args: argparse.Namespace) -> list[dict]:
     """Execute the requested mode and return records."""
+    if args.mode == "authcheck":
+        raw_cookie = COPART_SESSION_COOKIES if args.auth_mode in {"auto", "cookies"} else ""
+        cookie_map = parse_cookie_header(raw_cookie)
+        use_credentials = args.auth_mode in {"auto", "credentials"}
+        auth_status = await check_copart_auth_session(
+            session_cookies=cookie_map,
+            username=COPART_USERNAME if use_credentials else "",
+            password=COPART_PASSWORD if use_credentials else "",
+            playwright_debug=getattr(args, "playwright_debug", False),
+            playwright_pause_seconds=getattr(args, "playwright_pause_seconds", 0.0),
+            playwright_headless=False if getattr(args, "playwright_headed", False) else None,
+            playwright_artifact_dir=getattr(args, "playwright_artifact_dir", "") or None,
+        )
+        print(
+            json.dumps(
+                {
+                    "success": auth_status.success,
+                    "reason": auth_status.reason,
+                    "method": (
+                        "cookies"
+                        if cookie_map and auth_status.success
+                        else "credentials"
+                        if use_credentials
+                        else "none"
+                    ),
+                },
+                indent=2,
+            )
+        )
+        return []
+
     async with DiscoveryEngine(
         redis_url=args.redis_url,
         cache_ttl=args.ttl,
@@ -182,6 +261,7 @@ async def run(args: argparse.Namespace) -> list[dict]:
             max_results=args.max_results,
             page_size=args.page_size,
             force_refresh=args.force_refresh,
+            fail_fast_search_errors=args.strict_search_errors,
         )
 
 
@@ -192,7 +272,7 @@ def main() -> None:
 
     records = asyncio.run(run(args))
 
-    if args.mode != "healthcheck":
+    if args.mode not in {"healthcheck", "authcheck"}:
         output = json.dumps(records, indent=2, ensure_ascii=False)
         print(output)
 

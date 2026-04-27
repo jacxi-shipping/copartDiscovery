@@ -17,6 +17,7 @@ Async Python engine for discovering and hydrating vehicle lots from the
 | **Structured logging** | Plain text or JSON (`--json-logs`) via `python-json-logger` |
 | **Health check** | Probes Redis + Copart API connectivity |
 | **Run statistics** | Cache hits, misses, failures, elapsed time per run |
+| **Fallback records** | Bulk mode can build partial records from search hits if lot-detail calls fail |
 
 ---
 
@@ -37,6 +38,12 @@ For reproducible installs (exact pinned versions):
 
 ```bash
 pip install -r requirements-lock.txt
+```
+
+For credential login automation, install Playwright browser binaries:
+
+```bash
+python -m playwright install chromium
 ```
 
 ---
@@ -60,6 +67,9 @@ python main.py bulk --make FORD --sort-column repairCost --sort-order asc
 
 # Bypass cache and re-fetch everything
 python main.py bulk --make BMW --force-refresh
+
+# Fail fast on search API errors
+python main.py bulk --make TOYOTA --strict-search-errors
 ```
 
 ### Health check
@@ -67,6 +77,19 @@ python main.py bulk --make BMW --force-refresh
 ```bash
 python main.py healthcheck
 # {"redis": "ok", "api": "ok"}
+```
+
+### Auth check
+
+```bash
+python main.py authcheck --auth-mode auto
+# {"success": false, "reason": "...", "method": "credentials|cookies|none"}
+
+# Local interactive debug flow (headed browser + page pause + diagnostics)
+python main.py authcheck --auth-mode credentials --playwright-headed --playwright-pause-seconds 8 --playwright-debug
+
+# Save screenshot + HTML artifacts to a custom directory on Playwright failure
+python main.py authcheck --auth-mode credentials --playwright-debug --playwright-artifact-dir tmp/copart-auth
 ```
 
 ---
@@ -100,6 +123,8 @@ bulk
   --page-size N         Lots per search page (default: 100)
   --output FILE         Write results to this JSON file
   --force-refresh       Bypass cache and re-fetch from API
+  --strict-search-errors
+                        Fail fast on search API errors
 ```
 
 ---
@@ -110,6 +135,25 @@ bulk
 |---|---|---|
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
 | `CACHE_TTL_SECONDS` | `86400` | Cache TTL in seconds (24 h) |
+| `COPART_SEARCH_URL` | `https://www.copart.com/public/lots/search` | Search endpoint override |
+| `COPART_LOT_DETAILS_URL` | `https://www.copart.com/api/v1/public/lotdetails/{lot_number}` | Lot details endpoint override |
+| `COPART_AUTH_ENABLED` | `true` | Enable best-effort authenticated session bootstrap |
+| `COPART_PLAYWRIGHT_HEADLESS` | `true` | Run Playwright in headless mode for credential login (set `false` for local interactive login) |
+| `COPART_AUTH_DEBUG_DIR` | `.artifacts/copart-auth` | Default directory for Playwright screenshot/HTML failure artifacts |
+| `COPART_USERNAME` | `` | Copart username/email for optional login |
+| `COPART_PASSWORD` | `` | Copart password for optional login |
+| `COPART_SESSION_COOKIES` | `` | Cookie header string (`name=value; name2=value2`) to reuse browser-authenticated session |
+| `COPART_LOGIN_URL` | `https://www.copart.com/login` | Login page URL override |
+| `COPART_AUTH_PROBE_URL` | `https://www.copart.com/public/data/member/account` | URL used to verify authenticated session |
+
+When credentials are configured, the engine first attempts browser-based login
+with Playwright. If Playwright cannot complete the flow (for example WAF /
+captcha / anti-bot controls), the engine logs a warning and continues in
+resilient fallback mode.
+
+If automated username/password login is blocked, provide
+`COPART_SESSION_COOKIES` from an already logged-in browser session to run the
+engine with that authenticated context.
 
 ---
 

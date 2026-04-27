@@ -12,7 +12,7 @@ from typing import Any
 from .cache import RedisCache
 from .client import HttpClient
 from .config import DEFAULT_CONCURRENCY, LOT_DETAILS_URL
-from .models import build_lot_record, parse_lot_detail_response
+from .models import build_lot_record, build_lot_record_from_search_hit, parse_lot_detail_response
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +44,22 @@ async def _fetch_lot_from_api(
     cache: RedisCache,
     semaphore: asyncio.Semaphore,
     ttl: int | None = None,
+    search_fallback_hit: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """
     Fetch a single lot from the Copart API, validate, normalise, and cache it.
 
     Returns the normalised dict on success, ``None`` on any failure.
     """
+    def _fallback_record() -> dict[str, Any] | None:
+        if not search_fallback_hit:
+            return None
+        fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fallback = build_lot_record_from_search_hit(search_fallback_hit, fetched_at=fetched_at)
+        if fallback is None:
+            return None
+        return fallback.to_dict()
+
     async with semaphore:
         url = LOT_DETAILS_URL.format(lot_number=lot_number)
         logger.info("Hydrating lot %s from API", lot_number)
@@ -57,18 +67,33 @@ async def _fetch_lot_from_api(
             response = await http_client.get_json(url)
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to hydrate lot %s: %s", lot_number, exc)
-            return None
+            fallback = _fallback_record()
+            if fallback is None:
+                return None
+            logger.info("Using search fallback record for lot %s after API failure", lot_number)
+            await cache.set_lot(lot_number, fallback, ttl=ttl)
+            return fallback
 
     raw_detail = parse_lot_detail_response(response)
     if not raw_detail:
         logger.warning("Empty lot detail for %s", lot_number)
-        return None
+        fallback = _fallback_record()
+        if fallback is None:
+            return None
+        logger.info("Using search fallback record for lot %s after empty detail payload", lot_number)
+        await cache.set_lot(lot_number, fallback, ttl=ttl)
+        return fallback
 
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     record = build_lot_record(raw_detail, fetched_at=fetched_at)
     if record is None:
         logger.warning("Validation failed for lot %s", lot_number)
-        return None
+        fallback = _fallback_record()
+        if fallback is None:
+            return None
+        logger.info("Using search fallback record for lot %s after validation failure", lot_number)
+        await cache.set_lot(lot_number, fallback, ttl=ttl)
+        return fallback
 
     record_dict = record.to_dict()
     await cache.set_lot(lot_number, record_dict, ttl=ttl)
@@ -83,6 +108,7 @@ async def hydrate_lots(
     concurrency: int = DEFAULT_CONCURRENCY,
     ttl: int | None = None,
     force_refresh: bool = False,
+    search_fallback_map: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], HydrationStats]:
     """
     Hydrate *lot_numbers* concurrently, consulting Redis first.
@@ -101,6 +127,9 @@ async def hydrate_lots(
         Cache TTL override (seconds); ``None`` uses the cache default.
     force_refresh:
         When ``True``, skip cache reads and re-fetch everything from the API.
+    search_fallback_map:
+        Optional lot_number -> search-hit mapping used to build partial records
+        if detail hydration fails due to blocked/changed endpoints.
 
     Returns
     -------
@@ -137,7 +166,14 @@ async def hydrate_lots(
     if misses:
         semaphore = asyncio.Semaphore(concurrency)
         tasks = [
-            _fetch_lot_from_api(ln, http_client, cache, semaphore, ttl=ttl)
+            _fetch_lot_from_api(
+                ln,
+                http_client,
+                cache,
+                semaphore,
+                ttl=ttl,
+                search_fallback_hit=(search_fallback_map or {}).get(ln),
+            )
             for ln in misses
         ]
         api_results = await asyncio.gather(*tasks, return_exceptions=False)

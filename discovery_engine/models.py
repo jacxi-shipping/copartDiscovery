@@ -96,6 +96,59 @@ def build_lot_record(raw: dict[str, Any], fetched_at: str | None = None) -> LotR
     )
 
 
+def build_lot_record_from_search_hit(
+    search_hit: dict[str, Any],
+    fetched_at: str | None = None,
+) -> LotRecord | None:
+    """
+    Best-effort conversion from a search-result hit to a ``LotRecord``.
+
+    Search payloads often expose summary fields (lot number/description/image)
+    but not full dynamic details (VIN, repair cost, etc.). Missing fields are
+    safely defaulted.
+    """
+    if not isinstance(search_hit, dict):
+        return None
+
+    lot_number = (
+        search_hit.get("lotNumber")
+        or search_hit.get("lot_number")
+        or search_hit.get("lotNumberStr")
+        or search_hit.get("ln")
+    )
+    if not lot_number:
+        return None
+
+    image_candidates: list[str] = []
+    for key in ("imagesList", "images_list"):
+        value = search_hit.get(key)
+        if isinstance(value, list):
+            image_candidates.extend([str(v) for v in value if isinstance(v, str)])
+
+    for key in ("imgUrl", "imageUrl", "thumbUrl", "thb"):
+        value = search_hit.get(key)
+        if isinstance(value, str) and value.strip():
+            image_candidates.append(value)
+
+    lot_description = (
+        search_hit.get("lotDescription")
+        or search_hit.get("lot_description")
+        or search_hit.get("ld")
+        or search_hit.get("lDesc")
+        or ""
+    )
+
+    return LotRecord(
+        lotNumber=_coerce_str(lot_number),
+        lotDescription=_coerce_str(lot_description),
+        vin=_coerce_str(search_hit.get("vin") or search_hit.get("v")),
+        odometer=_coerce_number(search_hit.get("odometer") or search_hit.get("odo")),
+        repairCost=_coerce_number(search_hit.get("repairCost") or search_hit.get("repair_cost")),
+        imagesList=_coerce_images(image_candidates),
+        fetched_at=fetched_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
 def validate_search_payload(payload: dict[str, Any]) -> bool:
     """Return True if *payload* has the expected top-level structure."""
     if not isinstance(payload, dict):

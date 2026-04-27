@@ -205,3 +205,29 @@ class TestHydrateLots:
         http2.get_json = AsyncMock(return_value=good_response)
         records_second, stats_second = await hydrate_lots(["77777777"], http2, cache2)
         assert len(records_second) == 1
+
+    @pytest.mark.asyncio
+    async def test_uses_search_fallback_when_api_fails(self):
+        cache = self._make_cache(cached_map={"88888888": None})
+        http = MagicMock()
+        http.get_json = AsyncMock(side_effect=Exception("blocked"))
+        fallback_map = {
+            "88888888": {
+                "ln": "88888888",
+                "ld": "Fallback Car",
+                "thb": "https://img.example.com/fallback.jpg",
+            }
+        }
+
+        records, stats = await hydrate_lots(
+            ["88888888"],
+            http,
+            cache,
+            search_fallback_map=fallback_map,
+        )
+
+        assert len(records) == 1
+        assert records[0]["lotNumber"] == "88888888"
+        assert records[0]["lotDescription"] == "Fallback Car"
+        assert stats.api_failures == 0
+        cache.set_lot.assert_called_once()

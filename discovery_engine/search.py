@@ -11,6 +11,10 @@ from .config import BULK_MAX_RESULTS, DEFAULT_PAGE_SIZE, SEARCH_URL
 logger = logging.getLogger(__name__)
 
 
+class SearchRequestError(Exception):
+    """Raised when a search request fails due to API/network errors."""
+
+
 def _build_search_payload(
     filters: dict[str, Any] | None = None,
     sort: dict[str, str] | None = None,
@@ -76,7 +80,7 @@ async def search_lots(
         response = await http_client.post_json(SEARCH_URL, payload)
     except Exception as exc:  # noqa: BLE001
         logger.error("Search request failed (page=%d): %s", page, exc)
-        return []
+        raise SearchRequestError(f"search request failed for page {page}") from exc
 
     lots = _extract_lots(response)
     logger.info("Page %d returned %d lots", page, len(lots))
@@ -90,6 +94,7 @@ async def search_lots_bulk(
     sort: dict[str, str] | None = None,
     max_results: int = BULK_MAX_RESULTS,
     page_size: int = DEFAULT_PAGE_SIZE,
+    fail_fast: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     Async generator that yields individual lot dicts up to *max_results*.
@@ -98,6 +103,10 @@ async def search_lots_bulk(
     * *max_results* lots have been yielded, OR
     * a page returns fewer results than *page_size* (last page), OR
     * a page returns no results.
+
+    If *fail_fast* is ``True``, any request failure raises
+    :class:`SearchRequestError`. Otherwise, failures are logged and the
+    generator stops gracefully.
     """
     collected = 0
     page = 0
@@ -105,13 +114,19 @@ async def search_lots_bulk(
     while collected < max_results:
         remaining = max_results - collected
         size = min(page_size, remaining)
-        lots = await search_lots(
-            http_client,
-            filters=filters,
-            sort=sort,
-            page=page,
-            size=size,
-        )
+        try:
+            lots = await search_lots(
+                http_client,
+                filters=filters,
+                sort=sort,
+                page=page,
+                size=size,
+            )
+        except SearchRequestError:
+            if fail_fast:
+                raise
+            logger.error("Bulk search failed at page %d; stopping", page)
+            break
 
         if not lots:
             logger.info("No more lots at page %d; stopping bulk search", page)

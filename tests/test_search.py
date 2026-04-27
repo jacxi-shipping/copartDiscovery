@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from discovery_engine.search import _build_search_payload, _extract_lots, search_lots, search_lots_bulk
+from discovery_engine.search import (
+    SearchRequestError,
+    _build_search_payload,
+    _extract_lots,
+    search_lots,
+    search_lots_bulk,
+)
 
 
 class TestBuildSearchPayload:
@@ -67,11 +73,11 @@ class TestSearchLots:
         assert lots[0]["lotNumber"] == "11111111"
 
     @pytest.mark.asyncio
-    async def test_returns_empty_list_on_error(self):
+    async def test_raises_search_request_error_on_error(self):
         http = MagicMock()
         http.post_json = AsyncMock(side_effect=Exception("network error"))
-        lots = await search_lots(http)
-        assert lots == []
+        with pytest.raises(SearchRequestError):
+            await search_lots(http)
 
     @pytest.mark.asyncio
     async def test_passes_filters_to_payload(self):
@@ -140,3 +146,18 @@ class TestSearchLotsBulk:
         http.post_json = AsyncMock(side_effect=Exception("API down"))
         lots = [lot async for lot in search_lots_bulk(http, max_results=100, page_size=10)]
         assert lots == []
+
+    @pytest.mark.asyncio
+    async def test_search_error_raises_in_fail_fast_mode(self):
+        http = MagicMock()
+        http.post_json = AsyncMock(side_effect=Exception("API down"))
+        with pytest.raises(SearchRequestError):
+            _ = [
+                lot
+                async for lot in search_lots_bulk(
+                    http,
+                    max_results=100,
+                    page_size=10,
+                    fail_fast=True,
+                )
+            ]
